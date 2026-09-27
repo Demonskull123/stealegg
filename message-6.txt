@@ -1,0 +1,701 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local function hook_constants(src, consts, replacement)
+	local gc = getgc and getgc(true)
+	if not gc then return end
+	for _, func in ipairs(gc) do
+		if type(func) == "function" and islclosure(func) then
+			local info = debug.getinfo(func)
+			if info and info.source == src then
+				local constants = debug.getconstants(func)
+				if constants then
+					local match = true
+					for _, c in ipairs(consts) do
+						local found = false
+						for _, v in ipairs(constants) do
+							if v == c then found = true break end
+						end
+						if not found then match = false break end
+					end
+					if match then
+						pcall(hookfunction, func, newcclosure(replacement))
+					end
+				end
+			end
+		end
+	end
+end
+
+hook_constants("=ReplicatedFirst.UGI.ContentCatalog.AxisDelta", {
+	"LastVerticalSegmentDecision", "Displacement"
+}, function(...) return nil end)
+
+hook_constants("=ReplicatedFirst.UGI.ContentCatalog.Runtime", {
+	"FirstSuspiciousAt", "ValidationLocked"
+}, function() end)
+
+hook_constants("=ReplicatedFirst.UGI.ContentCatalog.Runtime", {
+	"CorrectionStarted", "CorrectionTarget", "Displacement"
+}, function() end)
+
+hook_constants("=ReplicatedFirst.UGI.ContentCatalog.ArcModel", {
+	"CorrectionStarted", "CorrectionTarget"
+}, function() end)
+
+hook_constants("=ReplicatedFirst.UGI.ContentCatalog.Impact", {
+	"OriginPosition", "Position"
+}, function(...) return nil end)
+
+hook_constants("=ReplicatedFirst.UGI.ContentCatalog.Impact", {
+	"AllowedHorizontalDistance", "HistoryCount"
+}, function(_,_,_)
+	return {
+		HorizontalDistance = 0,
+		AllowedHorizontalDistance = 99999,
+		VerticalDistance = 0,
+		AllowedVerticalDistance = 99999
+	}
+end)
+
+local function hook_runtime_pulse()
+	local gc = getgc and getgc(true)
+	if not gc then return end
+	for _, func in ipairs(gc) do
+		if type(func) == "function" and islclosure(func) then
+			local info = debug.getinfo(func)
+			if info and info.source then
+				local src = info.source
+				if src:find("RuntimePulse") or src:find("Runtime_") then
+					local constants = debug.getconstants(func)
+					if constants then
+						local hasGetChildren = false
+						local hasChallengeId = false
+						for _, v in ipairs(constants) do
+							if type(v) == "string" then
+								if v == "GetChildren" then hasGetChildren = true end
+								if v == "challengeId" then hasChallengeId = true end
+							end
+						end
+						if hasGetChildren and not hasChallengeId then
+							pcall(hookfunction, func, newcclosure(function() end))
+						end
+					end
+				end
+			end
+		end
+	end
+end
+hook_runtime_pulse()
+
+local function remove_anticollision(character)
+	local part = character and character:FindFirstChild("AntiCollisionHighSeedPushBack")
+	if part then part:Destroy() end
+end
+
+local Character = LocalPlayer.Character
+if Character then remove_anticollision(Character) end
+
+local Config = {
+	AutoSteal = false,
+	InstantStealPrompt = false,
+	StealArea = "All",
+	PrioritizeBestEggs = true,
+	StealMethod = "Instant",
+	StealDelay = 0.5,
+	WalkSpeedEnabled = false,
+	WalkSpeedValue = 16,
+	JumpPowerEnabled = false,
+	JumpPowerValue = 50,
+	InfiniteJump = false,
+	Noclip = false,
+	EggESP = false
+}
+
+local function get_primary_part()
+	local char = LocalPlayer.Character
+	if char then return char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart end
+end
+
+local function is_alive()
+	local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+	return humanoid and humanoid.Health > 0
+end
+
+local function teleport_to(pos)
+	local part = get_primary_part()
+	if part then
+		if typeof(pos) == "Vector3" then
+			part.CFrame = CFrame.new(pos + Vector3.new(0,3,0))
+		else
+			part.CFrame = pos + Vector3.new(0,3,0)
+		end
+	end
+end
+
+local function format_number(n)
+	if not n or n == 0 then return "0" end
+	if n >= 1e12 then return string.format("%.2fT", n/1e12) end
+	if n >= 1e9 then return string.format("%.2fB", n/1e9) end
+	if n >= 1e6 then return string.format("%.2fM", n/1e6) end
+	if n >= 1e3 then return string.format("%.1fK", n/1e3) end
+	return tostring(math.floor(n))
+end
+
+local EggCmds, PlotCmds, AreaEggSlotIdentity, AssetsDir, Rarities, AreasDir, Network
+pcall(function() EggCmds = require(ReplicatedStorage.Library.Client.EggCmds) end)
+pcall(function() PlotCmds = require(ReplicatedStorage.Library.Client.PlotCmds) end)
+pcall(function() AreaEggSlotIdentity = require(ReplicatedStorage.Library.Util.AreaEggSlotIdentity) end)
+pcall(function() AssetsDir = require(ReplicatedStorage.Directory.Assets).Directory end)
+pcall(function() Rarities = require(ReplicatedStorage.Directory.Rarity).Rarities end)
+pcall(function() AreasDir = require(ReplicatedStorage.Directory.Areas).Directory end)
+pcall(function() Network = require(ReplicatedStorage.Library.Client.Network) end)
+
+local blockedEvents = {
+	["ClientCharacter: IntegrityViolation"] = true,
+	["ClientCharacter: CorrectionStarted"] = true,
+	["ClientCharacter: RequestCharacterReset"] = true,
+	["RuntimeSync: Status"] = true
+}
+if Network then
+	local oldFire = Network.Fire
+	if oldFire then
+		Network.Fire = function(name, ...)
+			if blockedEvents[name] then return end
+			return oldFire(name, ...)
+		end
+	end
+	local oldUnreliable = Network.UnreliableFire
+	if oldUnreliable then
+		Network.UnreliableFire = function(name, ...)
+			if blockedEvents[name] then return end
+			return oldUnreliable(name, ...)
+		end
+	end
+	local oldInvoke = Network.Invoke
+	if oldInvoke then
+		Network.Invoke = function(name, ...)
+			if blockedEvents[name] then return end
+			return oldInvoke(name, ...)
+		end
+	end
+end
+
+ProximityPromptService.PromptShown:Connect(function(prompt)
+	if Config.InstantStealPrompt then
+		prompt.HoldDuration = 0
+		prompt.RequiresLineOfSight = false
+	end
+end)
+ProximityPromptService.PromptButtonHoldBegan:Connect(function(prompt)
+	if Config.InstantStealPrompt and fireproximityprompt then
+		fireproximityprompt(prompt)
+	end
+end)
+
+local eggCache = {}
+local areaTiers = {
+	Forest = 1, Lake = 2, Desert = 3, Jungle = 4, Snow = 5,
+	Volcano = 6, ["Abyss Ocean"] = 7, Prehistoric = 8, Cosmic = 9
+}
+local rarityColors = {
+	Common = Color3.fromRGB(160,160,160),
+	Uncommon = Color3.fromRGB(80,220,100),
+	Rare = Color3.fromRGB(60,160,255),
+	SuperRare = Color3.fromRGB(120,140,255),
+	Epic = Color3.fromRGB(180,70,255),
+	Legendary = Color3.fromRGB(255,170,20),
+	Mythic = Color3.fromRGB(255,45,100),
+	Cosmic = Color3.fromRGB(80,255,230),
+	Divine = Color3.fromRGB(255,220,80),
+	Secret = Color3.fromRGB(160,80,255),
+	Eternal = Color3.fromRGB(255,30,240),
+	Prismatic = Color3.fromRGB(255,100,200),
+	Rainbow = Color3.fromRGB(255,80,200)
+}
+
+function get_egg_meta(record)
+	local key = (record.AssetCategory or "Unknown") .. "_" .. (record.AreaId or "Zone")
+	if eggCache[key] then return eggCache[key] end
+	local meta = {
+		displayName = record.AssetCategory or "Unknown",
+		eggName = (record.AssetCategory or "Unknown") .. " Egg",
+		rarityName = "Common",
+		rarityColor = Color3.fromRGB(180,180,180),
+		cps = 0,
+		cpsFormatted = "0/s",
+		areaTier = areaTiers[record.AreaId] or 0,
+		score = 0
+	}
+	local asset = AssetsDir and AssetsDir[record.AssetCategory]
+	if asset then
+		if asset.DisplayName then meta.displayName = asset.DisplayName end
+		if asset.Egg and asset.Egg.DisplayName then
+			meta.eggName = asset.Egg.DisplayName
+		else
+			meta.eggName = meta.displayName .. " Egg"
+		end
+		if asset.EarningRate then
+			meta.cps = asset.EarningRate
+			meta.cpsFormatted = "+" .. format_number(asset.EarningRate) .. "/s"
+		end
+		if asset.Rarity then
+			local r = asset.Rarity
+			meta.rarityName = r.DisplayName or r._id or "Common"
+			if typeof(r.Color) == "Color3" then
+				meta.rarityColor = r.Color
+			elseif rarityColors[meta.rarityName] then
+				meta.rarityColor = rarityColors[meta.rarityName]
+			end
+		end
+	end
+	meta.score = meta.cps * 10 + meta.areaTier * 10000
+	eggCache[key] = meta
+	return meta
+end
+
+function place_egg(uid)
+	local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+	if tool then
+		local toolUid = tool:GetAttribute("UID") or tool:GetAttribute("Uid")
+		if toolUid then uid = toolUid end
+	end
+	if not uid then return false end
+	local plotData = PlotCmds and PlotCmds.GetPlotData and PlotCmds.GetPlotData()
+	if not plotData then return false end
+	local randX = math.random(-50,50) / 10
+	local randZ = math.random(-50,50) / 10
+	local cframe = CFrame.new(randX, -0.50011444091797, randZ, 1,0,0,0,1,0,0,0,1)
+	local net = Network or ReplicatedStorage:FindFirstChild("Network")
+	if net and net["Eggs: RequestPlaceEgg"] then
+		local ok = pcall(function()
+			return net["Eggs: RequestPlaceEgg"]:InvokeServer({Uid = uid, LocalCFrame = cframe})
+		end)
+		return ok == true
+	elseif EggCmds and EggCmds.RequestPlaceEgg then
+		local ok = pcall(function() return EggCmds.RequestPlaceEgg(uid, cframe) end)
+		return ok == true
+	end
+	return false
+end
+
+local ESPFolder = Instance.new("Folder")
+ESPFolder.Name = "Zevro_ESP"
+ESPFolder.Parent = (gethui and gethui()) or game:GetService("CoreGui") or LocalPlayer:WaitForChild("PlayerGui")
+
+local espObjects = {}
+
+function clear_esp()
+	for _, obj in pairs(espObjects) do
+		if obj.Billboard then obj.Billboard:Destroy() end
+		if obj.Anchor then obj.Anchor:Destroy() end
+	end
+	espObjects = {}
+end
+
+function update_esp()
+	if not Config.EggESP or not is_alive() or not EggCmds or not EggCmds.GetAreaEggSnapshot then
+		if next(espObjects) then clear_esp() end
+		return
+	end
+	local snapshot = EggCmds.GetAreaEggSnapshot()
+	if not snapshot or not snapshot.Records then
+		if next(espObjects) then clear_esp() end
+		return
+	end
+	local charPos = get_primary_part() and get_primary_part().Position or Vector3.zero
+	local active = {}
+	for _, rec in pairs(snapshot.Records) do
+		if rec.State == "Slot" and rec.Uid then
+			active[rec.Uid] = true
+			local cframe = rec.BottomCFrame or rec.BoundsCFrame
+			if cframe then
+				local meta = get_egg_meta(rec)
+				local dist = math.floor((cframe.Position - charPos).Magnitude)
+				local existing = espObjects[rec.Uid]
+				if not existing or not existing.Billboard or not existing.Billboard.Parent then
+					local billboard = Instance.new("BillboardGui")
+					billboard.Name = "EggESP_" .. rec.Uid
+					billboard.AlwaysOnTop = true
+					billboard.LightInfluence = 0
+					billboard.Size = UDim2.new(12,0, 3.35,0)
+					billboard.StudsOffset = Vector3.new(0,3.5,0)
+					billboard.MaxDistance = 600
+
+					local anchor = Instance.new("Part")
+					anchor.Size = Vector3.new(1,1,1)
+					anchor.Transparency = 1
+					anchor.CanCollide = false
+					anchor.Anchored = true
+					anchor.CFrame = cframe
+					anchor.Parent = ESPFolder
+					billboard.Adornee = anchor
+
+					local frame = Instance.new("Frame")
+					frame.Size = UDim2.new(1,0,1,0)
+					frame.BackgroundColor3 = Color3.fromRGB(15,6,26)
+					frame.BackgroundTransparency = 0.2
+					frame.BorderSizePixel = 0
+					frame.Parent = billboard
+
+					local stroke = Instance.new("UIStroke")
+					stroke.Color = meta.rarityColor
+					stroke.Thickness = 1.5
+					stroke.Transparency = 0.15
+					stroke.Parent = frame
+
+					local nameLbl = Instance.new("TextLabel")
+					nameLbl.Size = UDim2.new(0.62,0,0.32,0)
+					nameLbl.Position = UDim2.new(0.04,0,0.06,0)
+					nameLbl.BackgroundTransparency = 1
+					nameLbl.Font = Enum.Font.GothamBold
+					nameLbl.TextScaled = true
+					nameLbl.TextColor3 = Color3.fromRGB(245,245,255)
+					nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+					nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+					nameLbl.Text = meta.displayName
+					nameLbl.Parent = frame
+
+					local rarityLbl = Instance.new("TextLabel")
+					rarityLbl.Size = UDim2.new(0.32,0,0.28,0)
+					rarityLbl.Position = UDim2.new(0.64,0,0.08,0)
+					rarityLbl.BackgroundTransparency = 1
+					rarityLbl.Font = Enum.Font.GothamBold
+					rarityLbl.TextScaled = true
+					rarityLbl.TextColor3 = meta.rarityColor
+					rarityLbl.TextXAlignment = Enum.TextXAlignment.Right
+					rarityLbl.Text = meta.rarityName
+					rarityLbl.Parent = frame
+
+					local cpsLbl = Instance.new("TextLabel")
+					cpsLbl.Size = UDim2.new(0.92,0,0.3,0)
+					cpsLbl.Position = UDim2.new(0.04,0,0.38,0)
+					cpsLbl.BackgroundTransparency = 1
+					cpsLbl.Font = Enum.Font.GothamBold
+					cpsLbl.TextScaled = true
+					cpsLbl.TextColor3 = (meta.cps > 0 and Color3.fromHex("#80ffdb")) or Color3.fromRGB(180,180,180)
+					cpsLbl.TextXAlignment = Enum.TextXAlignment.Left
+					cpsLbl.Text = meta.cpsFormatted
+					cpsLbl.Parent = frame
+
+					local distLbl = Instance.new("TextLabel")
+					distLbl.Name = "SubLabel"
+					distLbl.Size = UDim2.new(0.92,0,0.26,0)
+					distLbl.Position = UDim2.new(0.04,0,0.69,0)
+					distLbl.BackgroundTransparency = 1
+					distLbl.Font = Enum.Font.Gotham
+					distLbl.TextScaled = true
+					distLbl.TextColor3 = Color3.fromHex("#b8dcf2")
+					distLbl.TextXAlignment = Enum.TextXAlignment.Left
+					distLbl.Text = string.format("%s  [%dm]", rec.AreaId or "Zone", dist)
+					distLbl.Parent = frame
+
+					billboard.Parent = ESPFolder
+
+					espObjects[rec.Uid] = {
+						Billboard = billboard,
+						Anchor = anchor,
+						SubLabel = distLbl,
+						AreaId = rec.AreaId or "Zone"
+					}
+				else
+					existing.SubLabel.Text = string.format("%s  [%dm]", existing.AreaId, dist)
+				end
+			end
+		end
+	end
+	for uid, obj in pairs(espObjects) do
+		if not active[uid] then
+			if obj.Billboard then obj.Billboard:Destroy() end
+			if obj.Anchor then obj.Anchor:Destroy() end
+			espObjects[uid] = nil
+		end
+	end
+end
+
+task.spawn(function()
+	while true do
+		task.wait(Config.StealDelay or 0.5)
+		if Config.AutoSteal and is_alive() and EggCmds and EggCmds.GetAreaEggSnapshot then
+			pcall(function()
+				local snapshot = EggCmds.GetAreaEggSnapshot()
+				if not snapshot or not snapshot.Records then return end
+				local respawn = PlotCmds and PlotCmds.GetRespawnPointCFrame and PlotCmds.GetRespawnPointCFrame()
+				local candidates = {}
+				for _, rec in pairs(snapshot.Records) do
+					if (Config.StealArea == "All" or rec.AreaId == Config.StealArea) and rec.State == "Slot" and rec.Uid then
+						table.insert(candidates, {record = rec, meta = get_egg_meta(rec)})
+					end
+				end
+				if Config.PrioritizeBestEggs then
+					table.sort(candidates, function(a,b) return a.meta.score > b.meta.score end)
+				end
+				for _, cand in ipairs(candidates) do
+					if not Config.AutoSteal or not is_alive() then return end
+					local rec = cand.record
+					local cframe = rec.BottomCFrame or rec.BoundsCFrame
+					if not cframe then continue end
+					local primary = get_primary_part()
+					if not primary then return end
+					local slotKey
+					if AreaEggSlotIdentity and AreaEggSlotIdentity.IsFirstAreaUid and AreaEggSlotIdentity.IsFirstAreaUid(rec.Uid) then
+						slotKey = AreaEggSlotIdentity.BuildSlotKey(rec.AreaId, rec.NestId)
+					end
+					primary.CFrame = CFrame.new(570,70,-335)
+					task.wait(0.08)
+					if Config.StealMethod == "Glide" then
+						primary.CFrame = cframe + Vector3.new(0,1.5,0)
+					else
+						primary.CFrame = cframe + Vector3.new(0,1.5,0)
+					end
+					task.wait(0.2)
+					EggCmds.RequestCarryAreaEgg(rec.Uid, slotKey)
+					task.wait(0.15)
+					primary.CFrame = CFrame.new(530,70,-335)
+					task.wait(0.08)
+					if respawn then
+						primary.CFrame = respawn + Vector3.new(0,3,0)
+					end
+					task.wait(0.15)
+					place_egg(rec.Uid)
+					task.wait(Config.StealDelay)
+				end
+			end)
+		end
+	end
+end)
+
+RunService.Heartbeat:Connect(function()
+	local char = LocalPlayer.Character
+	if char then remove_anticollision(char) end
+	if is_alive() then
+		local humanoid = char:FindFirstChildOfClass("Humanoid")
+		local root = get_primary_part()
+		if Config.WalkSpeedEnabled and humanoid and root and humanoid.MoveDirection.Magnitude > 0 then
+			local speed = Config.WalkSpeedValue or 60
+			root.AssemblyLinearVelocity = Vector3.new(humanoid.MoveDirection.X * speed, root.AssemblyLinearVelocity.Y, humanoid.MoveDirection.Z * speed)
+		end
+	end
+end)
+
+RunService.Stepped:Connect(function()
+	if Config.Noclip and is_alive() then
+		local char = LocalPlayer.Character
+		if char then
+			for _, part in ipairs(char:GetDescendants()) do
+				if part:IsA("BasePart") and part.CanCollide then
+					part.CanCollide = false
+				end
+			end
+		end
+	end
+end)
+
+UserInputService.JumpRequest:Connect(function()
+	if is_alive() then
+		local humanoid = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+		local root = get_primary_part()
+		if Config.InfiniteJump and humanoid then
+			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+		if Config.JumpPowerEnabled and root and humanoid then
+			local extra = math.max(0, (Config.JumpPowerValue or 100) - 50)
+			if extra > 0 then
+				root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 50 + extra, root.AssemblyLinearVelocity.Z)
+			end
+		end
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(1.5)
+		if Config.EggESP then pcall(update_esp) end
+	end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+	task.wait(0.3)
+	remove_anticollision(char)
+end)
+
+local library = loadstring(game:HttpGet(
+    "https://pastebin.com/raw/UyKrKHZt"
+))()
+local myUI = library.init("OUTLAW", "1.0", "OUTLAW")
+
+local stealLeft, stealRight = myUI:AddTab("Stealing", "")
+local teleLeft, teleRight = myUI:AddTab("Teleports", "")
+local moveLeft, moveRight = myUI:AddTab("Movement", "")
+local visualLeft, visualRight = myUI:AddTab("Visuals", "")
+local serverLeft, serverRight = myUI:AddTab("Server", "")
+local aboutLeft, aboutRight = myUI:AddTab("About Us", "")
+
+stealLeft:AddSeperator("Egg Farm")
+stealLeft:AddToggle({
+	title    = "Auto Steal Eggs",
+	desc     = "",
+	checked  = false,
+	callback = function(v) Config.AutoSteal = v end
+})
+stealLeft:AddToggle({
+	title    = "Instant Steal",
+	desc     = "",
+	checked  = false,
+	callback = function(v) Config.InstantStealPrompt = v end
+})
+stealLeft:AddToggle({
+	title    = "Prioritize Best Eggs First",
+	desc     = "",
+	checked  = true,
+	callback = function(v) Config.PrioritizeBestEggs = v end
+})
+stealLeft:AddDropdown({
+	title    = "Target Area",
+	desc     = "",
+	options  = {"All","Forest","Lake","Desert","Jungle","Snow","Volcano","Abyss Ocean","Prehistoric","Cosmic"},
+	default  = 1,
+	callback = function(_, text) Config.StealArea = text end
+})
+stealLeft:AddDropdown({
+	title    = "Steal Movement Method",
+	desc     = "",
+	options  = {"Instant","Glide"},
+	default  = 1,
+	callback = function(_, text) Config.StealMethod = text end
+})
+stealLeft:AddSlider({
+	title    = "Steal Delay (Seconds)",
+	desc     = "",
+	values   = { min = 1, max = 30, default = 5, round = 1 },
+	callback = function(v) Config.StealDelay = v / 10 end
+})
+
+teleLeft:AddSeperator("Bases")
+teleLeft:AddButton({
+	title    = "Teleport to My Base",
+	desc     = "",
+	callback = function()
+		local spawn = PlotCmds and PlotCmds.GetRespawnPointCFrame and PlotCmds.GetRespawnPointCFrame()
+		if spawn then teleport_to(spawn) end
+	end
+})
+for i=1,7 do
+	teleLeft:AddButton({
+		title    = "Teleport to Plot "..i,
+		desc     = "",
+		callback = function()
+			local plots = workspace:FindFirstChild("Plots")
+			if plots then
+				local plot = plots:FindFirstChild(tostring(i))
+				if plot and plot.PrimaryPart then
+					teleport_to(plot.PrimaryPart.CFrame)
+				elseif plot and plot:FindFirstChild("CenterPoint") then
+					teleport_to(plot.CenterPoint.CFrame)
+				end
+			end
+		end
+	})
+end
+
+teleRight:AddSeperator("Egg Zones")
+local zones = {
+	{"Forest Area", Vector3.new(597,68,-325)},
+	{"Lake Area", Vector3.new(747,68,-406)},
+	{"Desert Area", Vector3.new(955,68,-322)},
+	{"Jungle Area", Vector3.new(1194,70,-412)},
+	{"Snow Area", Vector3.new(1489,69,-318)},
+	{"Volcano Area", Vector3.new(1874,68,-400)},
+	{"Abyss Ocean Area", Vector3.new(2287,68,-325)},
+	{"Prehistoric Area", Vector3.new(2817,68,-395)},
+	{"Cosmic Area", Vector3.new(3389,68,-328)}
+}
+for _, zone in ipairs(zones) do
+	teleRight:AddButton({
+		title    = "Teleport to "..zone[1],
+		desc     = "",
+		callback = function() teleport_to(zone[2]) end
+	})
+end
+
+moveLeft:AddSeperator("Speed")
+moveLeft:AddToggle({
+	title    = "Enable Custom WalkSpeed",
+	desc     = "",
+	checked  = false,
+	callback = function(v) Config.WalkSpeedEnabled = v end
+})
+moveLeft:AddSlider({
+	title    = "WalkSpeed Value",
+	desc     = "",
+	values   = { min = 16, max = 900, default = 60, round = 1 },
+	callback = function(v) Config.WalkSpeedValue = v end
+})
+moveLeft:AddToggle({
+	title    = "Enable Custom JumpPower",
+	desc     = "",
+	checked  = false,
+	callback = function(v) Config.JumpPowerEnabled = v end
+})
+moveLeft:AddSlider({
+	title    = "JumpPower Value",
+	desc     = "",
+	values   = { min = 50, max = 250, default = 100, round = 1 },
+	callback = function(v) Config.JumpPowerValue = v end
+})
+
+moveRight:AddSeperator("Other")
+moveRight:AddToggle({
+	title    = "Infinite Jump",
+	desc     = "",
+	checked  = false,
+	callback = function(v) Config.InfiniteJump = v end
+})
+moveRight:AddToggle({
+	title    = "Noclip",
+	desc     = "",
+	checked  = false,
+	callback = function(v) Config.Noclip = v end
+})
+
+visualLeft:AddSeperator("ESP")
+visualLeft:AddToggle({
+	title    = "Egg ESP",
+	desc     = "",
+	checked  = false,
+	callback = function(v)
+		Config.EggESP = v
+		if v then update_esp() else clear_esp() end
+	end
+})
+
+serverLeft:AddSeperator("Server Options")
+serverLeft:AddButton({
+	title    = "Rejoin Server",
+	desc     = "",
+	callback = function()
+		game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+	end
+})
+serverLeft:AddButton({
+	title    = "Server Hop",
+	desc     = "",
+	callback = function()
+		pcall(function()
+			local data = HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100"))
+			for _, server in ipairs(data.data) do
+				if server.playing < server.maxPlayers and server.id ~= game.JobId then
+					game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, server.id, LocalPlayer)
+					break
+				end
+			end
+		end)
+	end
+})
+
